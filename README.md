@@ -44,6 +44,25 @@ objects, and do not copy or pack them. This small API does not cover atomic
 pointers, 64-bit values, arbitrary types or selectable memory orders. It is
 intended for C, not C++.
 
+### Why the atomic type is a struct
+
+`stlink_atomic_int_t` is a type-safety wrapper around an aligned `volatile long`
+on MSVC or an `_Atomic(int32_t)` on the C11 backend. The struct itself does not
+provide atomicity; the backend operations do.
+
+The wrapper makes accidental scalar operations such as `counter++` and
+`counter = 10` compile errors, encouraging callers to use
+`stlink_atomic_fetch_add(&counter, 1)` and `stlink_atomic_store(&counter, 10)`.
+This matters especially on MSVC: with a plain `volatile long` typedef,
+`counter++` would compile but would not be an atomic increment. `volatile`
+alone does not provide atomicity.
+
+A scalar typedef could work if callers consistently used the API, but the
+struct adds these guardrails without extra runtime operations. It does not
+fully enforce the rules: callers can still access `.value` or copy the whole
+struct, so live objects must be accessed only through the API and must not be
+copied.
+
 ## Build and test
 
 From a shell with the desired compiler on PATH (an MSYS2 shell, a Visual Studio
