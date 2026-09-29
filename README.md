@@ -1,4 +1,4 @@
-# ST-Link threading and atomics experiment
+# ST-Link threading, atomics and mutex experiment
 
 `src/stlink-env/pthreads/` contains an unchanged copy of `stlink_threads.h`,
 `stlink_threads_win32.c` and `stlink_threads_posix.c` from
@@ -63,6 +63,45 @@ fully enforce the rules: callers can still access `.value` or copy the whole
 struct, so live objects must be accessed only through the API and must not be
 copied.
 
+## Mutexes
+
+`src/stlink-env/mutex/stlink_mutex.h` provides a non-recursive, process-local
+mutex API. Windows uses an exclusive SRW lock (Windows 7 or newer for try-lock);
+POSIX uses `pthread_mutex_t`. Windows needs no pthread library. The public
+header includes the native platform header so mutexes need no heap allocation.
+
+```c
+#include "stlink_mutex.h"
+
+static stlink_mutex_t mutex = STLINK_MUTEX_INIT;
+static int counter;
+
+int32_t increment(void) {
+    int32_t error = stlink_mutex_lock(&mutex);
+    if(error != 0) { return error; }
+    ++counter;
+    return stlink_mutex_unlock(&mutex);
+}
+```
+
+For runtime initialization, declare `stlink_mutex_t mutex;` and check
+`stlink_mutex_init(&mutex)`. Use either initialization method, not both.
+All five functions (`init`, `destroy`, `lock`, `trylock`, `unlock`, with
+the `stlink_mutex_` prefix) return zero on success or an error code directly.
+`stlink_mutex_trylock` returns `EBUSY` if unavailable; it never waits.
+Only a successful lock or try-lock grants ownership.
+
+Only the owner may unlock. Do not acquire recursively, copy, move, or pack a
+live mutex. Protect all concurrent accesses to shared ordinary data with the
+same mutex; unlocking publishes writes to a subsequent successful acquisition.
+Call `stlink_mutex_destroy` only after the mutex is unlocked and all users
+have finished (usually after joining workers). Windows destruction is a no-op;
+lifetime rules still apply. Misuse is not reliably detected on either backend.
+No timed, recursive, or inter-process mutex operations are provided.
+
+Backend references: [Windows SRW locks](https://learn.microsoft.com/en-us/windows/win32/sync/slim-reader-writer--srw--locks),
+[POSIX mutex operations](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html).
+
 ## Build and test
 
 From a shell with the desired compiler on PATH (an MSYS2 shell, a Visual Studio
@@ -82,7 +121,10 @@ output directory, which is created automatically.
 The test checks operation return values, both compare-exchange outcomes,
 signed wraparound, four workers producing 400,000 increments through both
 fetch-add and compare-exchange, and publication of ordinary data through an
-atomic ready flag. Checks remain enabled in Release builds. CTest imposes a
+atomic ready flag. Mutex checks cover runtime/static initialization, reuse after
+destruction, contended and successful try-lock, and 400,000 protected increments
+with a two-field invariant and data publication through the lock. Checks remain
+enabled in Release builds. CTest imposes a
 30-second timeout.
 
 Verified with warnings treated as errors in optimized builds:

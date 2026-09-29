@@ -4,6 +4,7 @@
 
 #include "stlink_atomic.h"
 #include "stlink_threads.h"
+#include "stlink_mutex.h"
 
 enum { THREAD_COUNT = 4, INCREMENTS_PER_THREAD = 100000 };
 
@@ -79,6 +80,99 @@ static void increment_counter(void *arg) {
     printf("Thread %d finished %d increments.\n", thread_id, count);
 }
 
+/* Test failures terminate the process so no worker outlives its context. */
+static void require_success(int32_t error, const char *operation) {
+    if(error != 0) {
+        fprintf(stderr, "%s failed (error %" PRId32 ").\n", operation, error);
+        exit(EXIT_FAILURE);
+    }
+}
+
+struct mutex_probe {
+    stlink_mutex_t *mutex;
+    int32_t result;
+};
+
+static void try_mutex(void *arg) {
+    struct mutex_probe *probe = arg;
+    probe->result = stlink_mutex_trylock(probe->mutex);
+    if(probe->result == 0) {
+        require_success(stlink_mutex_unlock(probe->mutex), "probe unlock");
+    }
+}
+
+static int check_mutex_operations(void) {
+    stlink_mutex_t mutex;
+    require_success(stlink_mutex_init(&mutex), "mutex init");
+    require_success(stlink_mutex_lock(&mutex), "mutex lock");
+
+    /* The owner keeps the lock until a different thread has tried it. */
+    struct mutex_probe probe = { &mutex, 0 };
+    stlink_thread_t thread;
+    require_success(stlink_thread_create(&thread, try_mutex, &probe), "probe create");
+    require_success(stlink_thread_join(thread), "probe join");
+    require_success(stlink_mutex_unlock(&mutex), "mutex unlock");
+    require_success(stlink_mutex_destroy(&mutex), "mutex destroy");
+    CHECK(probe.result == EBUSY);
+
+    /* Reinitialize destroyed storage and acquire it without blocking. */
+    require_success(stlink_mutex_init(&mutex), "mutex reinit");
+    require_success(stlink_mutex_trylock(&mutex), "mutex trylock");
+    require_success(stlink_mutex_unlock(&mutex), "mutex unlock");
+    require_success(stlink_mutex_destroy(&mutex), "mutex destroy");
+    puts("Mutex operation checks passed.");
+    return EXIT_SUCCESS;
+}
+
+struct mutex_counter {
+    stlink_mutex_t mutex;
+    stlink_atomic_int_t start;
+    int count;
+    int mirror;
+    int errors;
+};
+
+static void increment_mutex_counter(void *arg) {
+    struct mutex_counter *state = arg;
+    while(stlink_atomic_load(&state->start) == 0) {}
+    for(int i = 0; i < INCREMENTS_PER_THREAD; ++i) {
+        require_success(stlink_mutex_lock(&state->mutex), "counter lock");
+        if(state->mirror != state->count) { ++state->errors; }
+        ++state->count;
+        state->mirror = state->count;
+        require_success(stlink_mutex_unlock(&state->mutex), "counter unlock");
+    }
+}
+
+static int check_mutex_counter(void) {
+    struct mutex_counter state = {
+        STLINK_MUTEX_INIT, STLINK_ATOMIC_INT_INIT(0), 0, 0, 0
+    };
+    stlink_thread_t threads[THREAD_COUNT];
+
+    /* Workers must observe this ordinary write through the mutex. */
+    require_success(stlink_mutex_lock(&state.mutex), "publication lock");
+    for(int i = 0; i < THREAD_COUNT; ++i) {
+        require_success(stlink_thread_create(&threads[i], increment_mutex_counter, &state),
+                        "counter thread create");
+    }
+    stlink_atomic_store(&state.start, 1);
+    state.count = 7;
+    state.mirror = 7;
+    require_success(stlink_mutex_unlock(&state.mutex), "publication unlock");
+
+    for(int i = 0; i < THREAD_COUNT; ++i) {
+        require_success(stlink_thread_join(threads[i]), "counter thread join");
+    }
+    require_success(stlink_mutex_destroy(&state.mutex), "counter mutex destroy");
+    const int expected = 7 + THREAD_COUNT * INCREMENTS_PER_THREAD;
+    printf("Mutex counter: %d (expected %d)\n", state.count, expected);
+    CHECK(state.count == expected);
+    CHECK(state.mirror == expected);
+    CHECK(state.errors == 0);
+    return EXIT_SUCCESS;
+}
+
 int main(void) {
 #if defined(_WIN32)
     puts("Threads: ST-Link Win32 wrapper");
@@ -87,6 +181,8 @@ int main(void) {
 #endif
     printf("Atomics: %s\n", STLINK_ATOMIC_BACKEND);
     if(check_atomic_operations() != EXIT_SUCCESS) { return EXIT_FAILURE; }
+    if(check_mutex_operations() != EXIT_SUCCESS) { return EXIT_FAILURE; }
+    if(check_mutex_counter() != EXIT_SUCCESS) { return EXIT_FAILURE; }
 
     stlink_thread_t threads[THREAD_COUNT];
     int thread_ids[THREAD_COUNT];
@@ -127,6 +223,6 @@ int main(void) {
     CHECK(actual == expected);
     CHECK(cas_actual == expected);
     CHECK(stlink_atomic_load(&publication_errors) == 0);
-    puts("Threading, atomic counters and flag publication passed.");
+    puts("Threading, atomics, mutexes and flag publication passed.");
     return EXIT_SUCCESS;
 }

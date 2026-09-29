@@ -14,14 +14,17 @@ set(CMAKE_C_EXTENSIONS ON)
 
 if(WIN32)
     set(STLINK_THREAD_SOURCE src/stlink-env/pthreads/stlink_threads_win32.c)
+    set(STLINK_MUTEX_SOURCE src/stlink-env/mutex/stlink_mutex_win32.c)
 else()
     set(STLINK_THREAD_SOURCE src/stlink-env/pthreads/stlink_threads_posix.c)
+    set(STLINK_MUTEX_SOURCE src/stlink-env/mutex/stlink_mutex_posix.c)
 endif()
 
-add_library(stlink_env STATIC ${STLINK_THREAD_SOURCE})
+add_library(stlink_env STATIC ${STLINK_THREAD_SOURCE} ${STLINK_MUTEX_SOURCE})
 target_include_directories(stlink_env PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/stlink-env/pthreads
     ${CMAKE_CURRENT_SOURCE_DIR}/src/stlink-env/atomic
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/stlink-env/mutex
 )
 if(NOT WIN32)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
