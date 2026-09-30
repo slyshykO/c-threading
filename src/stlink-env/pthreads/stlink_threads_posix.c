@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file           : stlink_threads_posix.c
-  * @brief          : pthreads wrapper for POSIX
+  * @brief          : POSIX thread backend (pthreads)
   * @copyright      : Copyright (c) 2026 stlink-org. All rights reserved.
   * @author         : Andreas Michelis (a-michelis)
   * @date           : 2026-09-15
@@ -12,6 +12,7 @@
   ******************************************************************************
   */
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -39,7 +40,7 @@ static void *stlink_thread_entry(void *raw) {
 int32_t stlink_thread_create(stlink_thread_t *thread, stlink_thread_fn fn, void *arg) {
     struct stlink_thread_ctx *ctx = malloc(sizeof(*ctx));
 
-    if(ctx == NULL) { return (-1); }
+    if(ctx == NULL) { return (ENOMEM); }
 
     ctx->fn = fn;
     ctx->arg = arg;

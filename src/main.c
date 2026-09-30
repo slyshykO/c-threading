@@ -2,11 +2,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sched.h>
+#endif
+
 #include "stlink_atomic.h"
 #include "stlink_threads.h"
 #include "stlink_mutex.h"
 
-enum { THREAD_COUNT = 4, INCREMENTS_PER_THREAD = 100000 };
+enum { THREAD_COUNT = 4, INCREMENTS_PER_THREAD = 100000, LIFECYCLE_ITERATIONS = 1000 };
 
 static stlink_atomic_int_t counter = STLINK_ATOMIC_INT_INIT(0);
 static stlink_atomic_int_t cas_counter = STLINK_ATOMIC_INT_INIT(0);
@@ -20,6 +27,16 @@ static int increments; /* Published to workers by the atomic ready flag. */
         return EXIT_FAILURE; \
     } \
 } while(0)
+
+/* Give up the CPU inside a spin-wait, so that a starved single-core machine
+ * lets the thread being waited for run instead of burning its whole quantum. */
+static void cpu_yield(void) {
+#if defined(_WIN32)
+    (void)SwitchToThread();
+#else
+    (void)sched_yield();
+#endif
+}
 
 static int check_atomic_operations(void) {
     stlink_atomic_int_t value;
@@ -61,7 +78,7 @@ static void increment_counter(void *arg) {
     const int thread_id = *(const int *)arg;
 
     /* A short start gate exercises flag synchronization and data publication. */
-    while(stlink_atomic_load(&ready) == 0) {}
+    while(stlink_atomic_load(&ready) == 0) { cpu_yield(); }
     const int count = increments;
     if(count != INCREMENTS_PER_THREAD) {
         stlink_atomic_fetch_add(&publication_errors, 1);
@@ -119,8 +136,74 @@ static int check_mutex_operations(void) {
     require_success(stlink_mutex_init(&mutex), "mutex reinit");
     require_success(stlink_mutex_trylock(&mutex), "mutex trylock");
     require_success(stlink_mutex_unlock(&mutex), "mutex unlock");
+
+    /* A free mutex can be taken, and released again, by a different thread. */
+    probe.result = EBUSY;
+    require_success(stlink_thread_create(&thread, try_mutex, &probe), "free probe create");
+    require_success(stlink_thread_join(thread), "free probe join");
+    CHECK(probe.result == 0);
+    require_success(stlink_mutex_trylock(&mutex), "mutex trylock after probe");
+    require_success(stlink_mutex_unlock(&mutex), "mutex unlock after probe");
     require_success(stlink_mutex_destroy(&mutex), "mutex destroy");
     puts("Mutex operation checks passed.");
+    return EXIT_SUCCESS;
+}
+
+struct self_join_probe {
+    stlink_thread_t thread;
+    stlink_atomic_int_t published;
+    int32_t result;
+};
+
+static void join_self(void *arg) {
+    struct self_join_probe *probe = arg;
+    /* The handle is written by stlink_thread_create; wait until it is published. */
+    while(stlink_atomic_load(&probe->published) == 0) { cpu_yield(); }
+    probe->result = stlink_thread_join(probe->thread);
+}
+
+static int check_thread_self_join(void) {
+    struct self_join_probe probe = { .published = STLINK_ATOMIC_INT_INIT(0) };
+    require_success(stlink_thread_create(&probe.thread, join_self, &probe), "self-join create");
+    stlink_atomic_store(&probe.published, 1);
+
+    /* A refused self-join must leave the thread joinable for this call. */
+    require_success(stlink_thread_join(probe.thread), "self-join join");
+    CHECK(probe.result == EDEADLK);
+    puts("Thread self-join check passed.");
+    return EXIT_SUCCESS;
+}
+
+static stlink_atomic_int_t lifecycle_runs = STLINK_ATOMIC_INT_INIT(0);
+
+static void lifecycle_worker(void *arg) {
+    (void)arg;
+    stlink_atomic_fetch_add(&lifecycle_runs, 1);
+}
+
+/* Repeated create and join must release everything: the per-thread context on
+ * both backends and, on Windows, the thread handle. */
+static int check_thread_lifecycle(void) {
+#if defined(_WIN32)
+    DWORD handles_before = 0;
+    DWORD handles_after = 0;
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &handles_before));
+#endif
+    for(int i = 0; i < LIFECYCLE_ITERATIONS; ++i) {
+        stlink_thread_t thread;
+        require_success(stlink_thread_create(&thread, lifecycle_worker, NULL), "lifecycle create");
+        require_success(stlink_thread_join(thread), "lifecycle join");
+    }
+    CHECK(stlink_atomic_load(&lifecycle_runs) == LIFECYCLE_ITERATIONS);
+#if defined(_WIN32)
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &handles_after));
+    /* A leaked handle per join would add LIFECYCLE_ITERATIONS; allow some noise. */
+    CHECK(handles_after < handles_before + LIFECYCLE_ITERATIONS / 10);
+
+    /* A handle that is not a thread cannot be waited on; it maps to EINVAL. */
+    CHECK(stlink_thread_join(NULL) == EINVAL);
+#endif
+    puts("Thread lifecycle checks passed.");
     return EXIT_SUCCESS;
 }
 
@@ -134,7 +217,7 @@ struct mutex_counter {
 
 static void increment_mutex_counter(void *arg) {
     struct mutex_counter *state = arg;
-    while(stlink_atomic_load(&state->start) == 0) {}
+    while(stlink_atomic_load(&state->start) == 0) { cpu_yield(); }
     for(int i = 0; i < INCREMENTS_PER_THREAD; ++i) {
         require_success(stlink_mutex_lock(&state->mutex), "counter lock");
         if(state->mirror != state->count) { ++state->errors; }
@@ -183,6 +266,8 @@ int main(void) {
     if(check_atomic_operations() != EXIT_SUCCESS) { return EXIT_FAILURE; }
     if(check_mutex_operations() != EXIT_SUCCESS) { return EXIT_FAILURE; }
     if(check_mutex_counter() != EXIT_SUCCESS) { return EXIT_FAILURE; }
+    if(check_thread_self_join() != EXIT_SUCCESS) { return EXIT_FAILURE; }
+    if(check_thread_lifecycle() != EXIT_SUCCESS) { return EXIT_FAILURE; }
 
     stlink_thread_t threads[THREAD_COUNT];
     int thread_ids[THREAD_COUNT];

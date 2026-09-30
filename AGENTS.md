@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository experiments with ST-Link threading and signed 32-bit atomics in C11.
+This repository experiments with ST-Link threading and signed 32-bit atomics in C17.
 - `src/main.c` contains the executable and regression checks.
 - `src/stlink-env/pthreads/` contains the shared thread API and Win32/POSIX implementations, copied from upstream ST-Link.
 - `src/stlink-env/atomic/stlink_atomic.h` provides header-only atomics using C11 operations or MSVC Interlocked intrinsics.
@@ -12,7 +12,7 @@ There is no separate test or asset directory. Keep generated output in `build/` 
 
 ## Build, Test, and Development Commands
 
-Use CMake 3.28 or newer, Ninja, and a C11-capable compiler available on PATH. For MSVC, start in a Visual Studio developer shell.
+Use CMake 3.28 or newer, Ninja, and a C17-capable compiler available on PATH. For MSVC, start in a Visual Studio developer shell.
 
 ```sh
 cmake -S . -B build/local -G Ninja -DCMAKE_BUILD_TYPE=Release

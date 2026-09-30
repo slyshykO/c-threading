@@ -6,11 +6,15 @@
 #include <stdint.h>
 
 #if defined(_WIN32)
-#include <windows.h>
+/*
+ * Opaque storage for an SRWLOCK, which is a single pointer. Declared here as a
+ * void* so that windows.h stays out of this header; the Win32 backend checks
+ * that the layout matches. All-zero is SRWLOCK_INIT.
+ */
 typedef struct {
-    SRWLOCK native;
+    void *native;
 } stlink_mutex_t;
-#define STLINK_MUTEX_INIT { SRWLOCK_INIT }
+#define STLINK_MUTEX_INIT { 0 }
 #else
 #include <pthread.h>
 typedef struct {

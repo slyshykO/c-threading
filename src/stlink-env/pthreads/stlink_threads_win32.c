@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file           : stlink_threads_win32.c
-  * @brief          : pthreads wrapper for WIN32
+  * @brief          : Win32 thread backend (_beginthreadex)
   * @copyright      : Copyright (c) 2026 stlink-org. All rights reserved.
   * @author         : Andreas Michelis (a-michelis)
   * @date           : 2026-09-15
@@ -42,10 +42,25 @@ static unsigned __stdcall stlink_thread_entry(void *raw) {
     return (0);
 }
 
+/*
+ * The API reports errno-style codes on every platform, so a Win32 error is
+ * translated. Only memory exhaustion is told apart; every other failure of
+ * waiting on a thread handle (an invalid handle, mostly) is a bad argument.
+ */
+static int32_t stlink_thread_error(DWORD code) {
+    switch(code) {
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+        return (ENOMEM);
+    default:
+        return (EINVAL);
+    }
+}
+
 int32_t stlink_thread_create(stlink_thread_t *thread, stlink_thread_fn fn, void *arg) {
     struct stlink_thread_ctx *ctx = malloc(sizeof(*ctx));
 
-    if(ctx == NULL) { return (-1); }
+    if(ctx == NULL) { return (ENOMEM); }
 
     ctx->fn = fn;
     ctx->arg = arg;
@@ -57,7 +72,8 @@ int32_t stlink_thread_create(stlink_thread_t *thread, stlink_thread_fn fn, void 
     if(handle == 0) {
         int32_t error = (int32_t)errno;
         free(ctx);
-        return ((error == 0) ? -1 : error);
+        /* _beginthreadex sets errno; EAGAIN is the resource-exhaustion case. */
+        return ((error == 0) ? EAGAIN : error);
     }
 
     *thread = (stlink_thread_t)handle;
@@ -66,8 +82,16 @@ int32_t stlink_thread_create(stlink_thread_t *thread, stlink_thread_fn fn, void 
 }
 
 int32_t stlink_thread_join(stlink_thread_t thread) {
-    if(WaitForSingleObject((HANDLE)thread, INFINITE) != WAIT_OBJECT_0) {
-        return ((int32_t)GetLastError());
+    /* Waiting on the calling thread's own handle would never return, whereas
+     * pthreads reports EDEADLK. GetThreadId is 0 for an invalid handle, which
+     * never equals a real thread id, so that case falls through to the wait. */
+    if(GetThreadId((HANDLE)thread) == GetCurrentThreadId()) { return (EDEADLK); }
+
+    DWORD wait = WaitForSingleObject((HANDLE)thread, INFINITE);
+
+    if(wait != WAIT_OBJECT_0) {
+        /* GetLastError is only meaningful after WAIT_FAILED. */
+        return ((wait == WAIT_FAILED) ? stlink_thread_error(GetLastError()) : EINVAL);
     }
 
     CloseHandle((HANDLE)thread);

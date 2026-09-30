@@ -1,12 +1,33 @@
 # ST-Link threading, atomics and mutex experiment
 
-`src/stlink-env/pthreads/` contains an unchanged copy of `stlink_threads.h`,
+`src/stlink-env/pthreads/` started as a copy of `stlink_threads.h`,
 `stlink_threads_win32.c` and `stlink_threads_posix.c` from
-`D:/Projects/stlink-origin/src/stlink-env/pthreads/`. The upstream BSD license
+`D:/Projects/stlink-origin/src/stlink-env/pthreads/` and has since been changed
+here; `REVIEW.md` lists what changed and why. The upstream BSD license
 is in `LICENSE`. The original ST-Link checkout is not modified.
+
+The project is written in C17 (`CMAKE_C_STANDARD 17`, compiler extensions off).
 
 CMake selects `_beginthreadex`/Win32 on Windows and pthreads on POSIX systems.
 Windows builds do not use `<threads.h>` or link a pthread library.
+
+## Threads
+
+`stlink_threads.h` offers `stlink_thread_create` and `stlink_thread_join`. Both
+return zero on success, otherwise a positive errno-style value on every
+platform (`ENOMEM`, `EAGAIN`, `EINVAL`, and `EDEADLK` for a thread joining
+itself; POSIX may report more). They never return a negative value and do not
+use `errno` to report. Win32 errors are translated to these codes.
+
+Every created thread must be joined exactly once; there is no detach. A failed
+join leaves the thread joinable. `*thread` is written only on success, and the
+new thread may run before `stlink_thread_create` returns, so a worker must not
+read its own handle from `*thread`. A thread entry point returns `void`.
+
+There is no stack-size parameter, so a worker gets the platform default: the
+executable's linked stack size on Windows (1 MB by default with MSVC), usually
+8 MB with glibc, about 128 KB with musl and 512 KB on macOS. Keep large buffers
+off a worker's stack.
 
 ## Atomics
 
@@ -67,8 +88,11 @@ copied.
 
 `src/stlink-env/mutex/stlink_mutex.h` provides a non-recursive, process-local
 mutex API. Windows uses an exclusive SRW lock (Windows 7 or newer for try-lock);
-POSIX uses `pthread_mutex_t`. Windows needs no pthread library. The public
-header includes the native platform header so mutexes need no heap allocation.
+POSIX uses `pthread_mutex_t`. Windows needs no pthread library. The mutex
+lives inside `stlink_mutex_t`, so mutexes need no heap allocation. On Windows
+the header stores the SRW lock as a pointer-sized field and does not include
+`<windows.h>`; the Windows source checks that the layout matches and requires
+`_WIN32_WINNT` of at least `0x0601`.
 
 ```c
 #include "stlink_mutex.h"
@@ -128,9 +152,14 @@ The test checks operation return values, both compare-exchange outcomes,
 signed wraparound, four workers producing 400,000 increments through both
 fetch-add and compare-exchange, and publication of ordinary data through an
 atomic ready flag. Mutex checks cover runtime/static initialization, reuse after
-destruction, contended and successful try-lock, and 400,000 protected increments
-with a two-field invariant and data publication through the lock. Checks remain
-enabled in Release builds. CTest imposes a
+destruction, contended and successful try-lock (including from a second thread),
+and 400,000 protected increments with a two-field invariant and data
+publication through the lock. Thread checks cover a refused self-join
+(`EDEADLK`) and 1,000 create/join cycles, which on Windows also verify that the
+process handle count does not grow and that joining a non-thread handle gives
+`EINVAL`. Waiting workers yield the CPU while they spin. The allocation and
+thread-creation failure paths (`ENOMEM`, `EAGAIN`) cannot be forced by these
+checks. Checks remain enabled in Release builds. CTest imposes a
 30-second timeout.
 
 Verified with warnings treated as errors in optimized builds:
