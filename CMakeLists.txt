@@ -8,9 +8,20 @@ endif()
 
 project(c-th LANGUAGES C)
 
-set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
+
+if(MSVC)
+    # Remove cached/toolchain warning flags, including per-configuration flags.
+    get_cmake_property(cmake_variables VARIABLES)
+    foreach(variable IN LISTS cmake_variables)
+        if(variable MATCHES "^CMAKE_C_FLAGS($|_[A-Z0-9_]+$)")
+            string(REGEX REPLACE "(^|[ \t\r\n])/[wW][^ \t\r\n]*" "\\1"
+                ${variable} "${${variable}}")
+        endif()
+    endforeach()
+endif()
 
 if(WIN32)
     set(STLINK_THREAD_SOURCE src/stlink-env/pthreads/stlink_threads_win32.c)
@@ -34,6 +45,13 @@ endif()
 
 add_executable(${PROJECT_NAME} src/main.c)
 target_link_libraries(${PROJECT_NAME} PRIVATE stlink_env)
+
+if(MSVC)
+    foreach(target IN ITEMS stlink_env ${PROJECT_NAME})
+        target_compile_options(${target} PRIVATE /W4)
+        set_property(TARGET ${target} PROPERTY COMPILE_WARNING_AS_ERROR OFF)
+    endforeach()
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

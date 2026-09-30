@@ -118,6 +118,12 @@ Use a different build directory for each compiler. Set `-DCMAKE_C_COMPILER=gcc`,
 also copied into `release/`. `-DRELEASE_DIR=<directory>` selects a separate
 output directory, which is created automatically.
 
+MSVC builds use `/W4` for both targets. CMake removes existing `/w*` and
+`/W*` options (including `/WX` and per-warning overrides) from `CMAKE_C_FLAGS`
+and its configuration variants in the project scope, leaving cached values
+unchanged. Both targets disable `COMPILE_WARNING_AS_ERROR` so it cannot add
+`/WX` back. Other compilers retain their configured warning options.
+
 The test checks operation return values, both compare-exchange outcomes,
 signed wraparound, four workers producing 400,000 increments through both
 fetch-add and compare-exchange, and publication of ordinary data through an
