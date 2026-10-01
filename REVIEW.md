@@ -61,14 +61,31 @@ returns errno values.
 - Proposed: make the native member an opaque pointer-sized field (`SRWLOCK` is `{ PVOID Ptr; }`), keep
   `windows.h` in the `.c` file, add a size/alignment static assert there. Fallback: define
   `WIN32_LEAN_AND_MEAN` and `NOMINMAX` before the include.
-- Constraint: `STLINK_MUTEX_INIT` must stay a valid static initializer on Windows.
+- Original constraint: `STLINK_MUTEX_INIT` must stay a valid static initializer
+  on Windows (superseded by the opaque mutex API below).
 
-Fix: `stlink_mutex.h` no longer includes `<windows.h>`. On Windows `stlink_mutex_t` is now
+Initial fix: `stlink_mutex.h` no longer includes `<windows.h>`. On Windows `stlink_mutex_t` became
 `struct { void *native; }` and `STLINK_MUTEX_INIT` is `{ 0 }` (all-zero equals `SRWLOCK_INIT`).
 `stlink_mutex_win32.c` now includes `<windows.h>` itself, reaches the storage through a private
 `stlink_mutex_native()` helper that casts to `SRWLOCK *`, and has three `_Static_assert`s
 guarding that size, alignment and offset match `SRWLOCK`. The POSIX side is unchanged.
 `<errno.h>` stays in the header because `EBUSY` is part of the public contract.
+
+Follow-up: `stlink_mutex_t` is now a pointer to a forward-declared
+`struct stlink_mutex` on both platforms, matching the thread handle style. The
+Windows source defines the struct with an actual `SRWLOCK`, and the POSIX source
+defines it with `pthread_mutex_t`. The mutex header exposes neither
+native type nor native header; the layout casts and static assertions are gone.
+`stlink_mutex_create(stlink_mutex_t *)` replaces `stlink_mutex_init` and
+`STLINK_MUTEX_INIT`, allocating and initializing an unlocked mutex. It publishes
+the handle only on success, returns `ENOMEM` on allocation failure, and frees
+the allocation if POSIX initialization fails. Successful destroy frees storage
+on both backends; a failed POSIX destroy leaves it allocated and live. Callers
+now store handles and explicitly create before sharing; other operations take
+the handle by value. Regression checks cover recreation, 1,000 create/destroy
+cycles with two independent locks, contended and
+successful try-lock, and publication through the mutex. This intentionally drops
+the original static-initializer constraint in favor of an opaque allocated object.
 
 ### 3. No minimum Windows version is declared - `fixed`
 
@@ -179,8 +196,8 @@ Fix:
   `/experimental:c11atomics`, clang-cl takes the same path; `fetch_sub` negation for `INT32_MIN` is
   handled; MinGW-gcc falls through to `<stdatomic.h>`.
 - Mutexes: SRWLOCK vs `pthread_mutex_t` semantics match the documented contract (non-recursive,
-  `trylock` returns `EBUSY`, unlock-then-lock publishes writes); static initializers nest correctly
-  in `struct mutex_counter`; publication through the mutex in `check_mutex_counter` is ordered correctly.
+  `trylock` returns `EBUSY`, unlock-then-lock publishes writes); `struct mutex_counter` now owns a
+  pointer created before sharing; publication through the mutex in `check_mutex_counter` is ordered correctly.
 - Threads: no race on `*thread` (the new thread never reads it); `ctx` ownership is correct on both
   paths (freed in the entry function, or on create failure).
 
@@ -213,3 +230,21 @@ Finding 3 (same setup, rebuilt after adding the guard): MSVC and MinGW gcc both 
 `threading-and-atomics` with no warnings; the guard fires on `-D_WIN32_WINNT=0x0501` (gcc, syntax
 check only). The compiler minimums declared in `stlink-origin` were not read, so the claim that their
 default `_WIN32_WINNT` is >= `0x0601` rests on the stated Windows 10+ target, not on a checked file.
+
+Opaque mutex follow-up (2026-10-01): CMake builds and `threading-and-atomics`
+pass with Windows x64 MinGW GCC (`-Wall -Wextra -Wpedantic -Werror`), Windows
+x64 MSVC 19.51 (`/W4`), and WSL Linux GCC (`-Wall -Wextra -Wpedantic -Werror`),
+all in Release, with no warnings. A separate Linux GCC build of the full
+regression executable passes AddressSanitizer and UndefinedBehaviorSanitizer
+with leak detection enabled. A temporary linker-wrapping harness under
+`build/opaque-mutex-checks/` verifies allocation failure returns `ENOMEM` and
+leaves the output unchanged on Windows and POSIX; it also verifies POSIX init
+failure frees its allocation, destroy failure retains the allocation and leaves
+the mutex usable, and successful destroy balances allocations. The harness is
+an ad hoc check, not part of CTest. Not re-tested for this follow-up: macOS,
+musl, Clang, clang-cl, or 32-bit Windows.
+
+After changing the typedef to `typedef struct stlink_mutex *stlink_mutex_t`,
+the same Windows GCC/MSVC and Linux GCC CMake builds and CTest runs pass again,
+as do the Windows and POSIX failure-cleanup harnesses. Sanitizers were run on
+the earlier explicit-pointer version, not repeated for the typedef-only change.

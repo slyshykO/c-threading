@@ -106,7 +106,7 @@ static void require_success(int32_t error, const char *operation) {
 }
 
 struct mutex_probe {
-    stlink_mutex_t *mutex;
+    stlink_mutex_t mutex;
     int32_t result;
 };
 
@@ -119,33 +119,58 @@ static void try_mutex(void *arg) {
 }
 
 static int check_mutex_operations(void) {
-    stlink_mutex_t mutex;
-    require_success(stlink_mutex_init(&mutex), "mutex init");
-    require_success(stlink_mutex_lock(&mutex), "mutex lock");
+    stlink_mutex_t mutex = NULL;
+    require_success(stlink_mutex_create(&mutex), "mutex create");
+    CHECK(mutex != NULL);
+    require_success(stlink_mutex_lock(mutex), "mutex lock");
 
     /* The owner keeps the lock until a different thread has tried it. */
-    struct mutex_probe probe = { &mutex, 0 };
+    struct mutex_probe probe = { mutex, 0 };
     stlink_thread_t thread;
     require_success(stlink_thread_create(&thread, try_mutex, &probe), "probe create");
     require_success(stlink_thread_join(thread), "probe join");
-    require_success(stlink_mutex_unlock(&mutex), "mutex unlock");
-    require_success(stlink_mutex_destroy(&mutex), "mutex destroy");
+    require_success(stlink_mutex_unlock(mutex), "mutex unlock");
+    require_success(stlink_mutex_destroy(mutex), "mutex destroy");
     CHECK(probe.result == EBUSY);
 
-    /* Reinitialize destroyed storage and acquire it without blocking. */
-    require_success(stlink_mutex_init(&mutex), "mutex reinit");
-    require_success(stlink_mutex_trylock(&mutex), "mutex trylock");
-    require_success(stlink_mutex_unlock(&mutex), "mutex unlock");
+    /* Reuse the handle variable for a new mutex, initially unlocked. */
+    mutex = NULL;
+    require_success(stlink_mutex_create(&mutex), "mutex recreate");
+    CHECK(mutex != NULL);
+    require_success(stlink_mutex_trylock(mutex), "mutex trylock");
+    require_success(stlink_mutex_unlock(mutex), "mutex unlock");
 
     /* A free mutex can be taken, and released again, by a different thread. */
+    probe.mutex = mutex;
     probe.result = EBUSY;
     require_success(stlink_thread_create(&thread, try_mutex, &probe), "free probe create");
     require_success(stlink_thread_join(thread), "free probe join");
     CHECK(probe.result == 0);
-    require_success(stlink_mutex_trylock(&mutex), "mutex trylock after probe");
-    require_success(stlink_mutex_unlock(&mutex), "mutex unlock after probe");
-    require_success(stlink_mutex_destroy(&mutex), "mutex destroy");
+    require_success(stlink_mutex_trylock(mutex), "mutex trylock after probe");
+    require_success(stlink_mutex_unlock(mutex), "mutex unlock after probe");
+    require_success(stlink_mutex_destroy(mutex), "mutex destroy");
     puts("Mutex operation checks passed.");
+    return EXIT_SUCCESS;
+}
+
+static int check_mutex_lifecycle(void) {
+    stlink_mutex_t mutex = NULL;
+    for(int i = 0; i < LIFECYCLE_ITERATIONS; ++i) {
+        stlink_mutex_t other = NULL;
+        require_success(stlink_mutex_create(&mutex), "lifecycle mutex create");
+        require_success(stlink_mutex_create(&other), "independent mutex create");
+        CHECK(mutex != NULL && other != NULL && mutex != other);
+
+        /* A held mutex must not prevent acquiring a separately created one. */
+        require_success(stlink_mutex_lock(mutex), "lifecycle mutex lock");
+        require_success(stlink_mutex_trylock(other), "independent mutex trylock");
+        require_success(stlink_mutex_unlock(other), "independent mutex unlock");
+        require_success(stlink_mutex_destroy(other), "independent mutex destroy");
+        require_success(stlink_mutex_unlock(mutex), "lifecycle mutex unlock");
+        require_success(stlink_mutex_destroy(mutex), "lifecycle mutex destroy");
+        mutex = NULL;
+    }
+    puts("Mutex lifecycle checks passed.");
     return EXIT_SUCCESS;
 }
 
@@ -219,22 +244,23 @@ static void increment_mutex_counter(void *arg) {
     struct mutex_counter *state = arg;
     while(stlink_atomic_load(&state->start) == 0) { cpu_yield(); }
     for(int i = 0; i < INCREMENTS_PER_THREAD; ++i) {
-        require_success(stlink_mutex_lock(&state->mutex), "counter lock");
+        require_success(stlink_mutex_lock(state->mutex), "counter lock");
         if(state->mirror != state->count) { ++state->errors; }
         ++state->count;
         state->mirror = state->count;
-        require_success(stlink_mutex_unlock(&state->mutex), "counter unlock");
+        require_success(stlink_mutex_unlock(state->mutex), "counter unlock");
     }
 }
 
 static int check_mutex_counter(void) {
     struct mutex_counter state = {
-        STLINK_MUTEX_INIT, STLINK_ATOMIC_INT_INIT(0), 0, 0, 0
+        NULL, STLINK_ATOMIC_INT_INIT(0), 0, 0, 0
     };
     stlink_thread_t threads[THREAD_COUNT];
+    require_success(stlink_mutex_create(&state.mutex), "counter mutex create");
 
     /* Workers must observe this ordinary write through the mutex. */
-    require_success(stlink_mutex_lock(&state.mutex), "publication lock");
+    require_success(stlink_mutex_lock(state.mutex), "publication lock");
     for(int i = 0; i < THREAD_COUNT; ++i) {
         require_success(stlink_thread_create(&threads[i], increment_mutex_counter, &state),
                         "counter thread create");
@@ -242,12 +268,12 @@ static int check_mutex_counter(void) {
     stlink_atomic_store(&state.start, 1);
     state.count = 7;
     state.mirror = 7;
-    require_success(stlink_mutex_unlock(&state.mutex), "publication unlock");
+    require_success(stlink_mutex_unlock(state.mutex), "publication unlock");
 
     for(int i = 0; i < THREAD_COUNT; ++i) {
         require_success(stlink_thread_join(threads[i]), "counter thread join");
     }
-    require_success(stlink_mutex_destroy(&state.mutex), "counter mutex destroy");
+    require_success(stlink_mutex_destroy(state.mutex), "counter mutex destroy");
     const int expected = 7 + THREAD_COUNT * INCREMENTS_PER_THREAD;
     printf("Mutex counter: %d (expected %d)\n", state.count, expected);
     CHECK(state.count == expected);
@@ -265,6 +291,7 @@ int main(void) {
     printf("Atomics: %s\n", STLINK_ATOMIC_BACKEND);
     if(check_atomic_operations() != EXIT_SUCCESS) { return EXIT_FAILURE; }
     if(check_mutex_operations() != EXIT_SUCCESS) { return EXIT_FAILURE; }
+    if(check_mutex_lifecycle() != EXIT_SUCCESS) { return EXIT_FAILURE; }
     if(check_mutex_counter() != EXIT_SUCCESS) { return EXIT_FAILURE; }
     if(check_thread_self_join() != EXIT_SUCCESS) { return EXIT_FAILURE; }
     if(check_thread_lifecycle() != EXIT_SUCCESS) { return EXIT_FAILURE; }

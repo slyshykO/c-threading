@@ -89,38 +89,65 @@ copied.
 `src/stlink-env/mutex/stlink_mutex.h` provides a non-recursive, process-local
 mutex API. Windows uses an exclusive SRW lock (Windows 7 or newer for try-lock);
 POSIX uses `pthread_mutex_t`. Windows needs no pthread library. The mutex
-lives inside `stlink_mutex_t`, so mutexes need no heap allocation. On Windows
-the header stores the SRW lock as a pointer-sized field and does not include
-`<windows.h>`; the Windows source checks that the layout matches and requires
-`_WIN32_WINNT` of at least `0x0601`.
+handle is opaque: the header declares
+`typedef struct stlink_mutex *stlink_mutex_t`, and each backend defines the
+struct with its actual native lock. The public mutex header includes neither
+`<windows.h>` nor `<pthread.h>`.
+The Windows source requires `_WIN32_WINNT` of at least `0x0601`.
 
 ```c
+#include <stddef.h>
 #include "stlink_mutex.h"
 
-static stlink_mutex_t mutex = STLINK_MUTEX_INIT;
+static stlink_mutex_t mutex;
 static int counter;
 
+/* Call before starting workers; check the result before using the mutex. */
+int32_t counter_create(void) {
+    return stlink_mutex_create(&mutex);
+}
+
 int32_t increment(void) {
-    int32_t error = stlink_mutex_lock(&mutex);
+    int32_t error = stlink_mutex_lock(mutex);
     if(error != 0) { return error; }
     ++counter;
-    return stlink_mutex_unlock(&mutex);
+    return stlink_mutex_unlock(mutex);
+}
+
+/* Call once, after all workers have finished. */
+int32_t counter_destroy(void) {
+    int32_t error = stlink_mutex_destroy(mutex);
+    if(error == 0) { mutex = NULL; }
+    return error;
 }
 ```
 
-For runtime initialization, declare `stlink_mutex_t mutex;` and check
-`stlink_mutex_init(&mutex)`. Use either initialization method, not both.
-All five functions (`init`, `destroy`, `lock`, `trylock`, `unlock`, with
-the `stlink_mutex_` prefix) return zero on success or an error code directly.
+Declare `stlink_mutex_t mutex` and check `stlink_mutex_create(&mutex)` before
+sharing it, matching the thread handle API. Creation allocates an unlocked
+mutex, writes the handle only on success, and leaves it unchanged on failure.
+It returns `ENOMEM` if allocation fails, or an initialization error from
+pthreads. The output argument must not be NULL. Other operations take the
+handle by value and require a non-NULL, live mutex; these preconditions are
+unchecked.
+
+This replaces the former `stlink_mutex_init` and `STLINK_MUTEX_INIT` API;
+there is no static mutex initializer. A static handle still needs an explicit
+create call. All five functions (`create`, `destroy`, `lock`, `trylock`,
+`unlock`, with the `stlink_mutex_` prefix) return zero on success or a positive
+errno-style code directly, not via `errno`.
 `stlink_mutex_trylock` returns `EBUSY` if unavailable; it never waits.
 Only a successful lock or try-lock grants ownership.
 
-Only the owner may unlock. Do not acquire recursively, copy, move, or pack a
-live mutex. Protect all concurrent accesses to shared ordinary data with the
+Only the owner may unlock. Do not acquire recursively. Handles can be copied
+and shared; they all refer to the same mutex and do not duplicate it or extend
+its lifetime. Protect all concurrent accesses to shared ordinary data with the
 same mutex; unlocking publishes writes to a subsequent successful acquisition.
 Call `stlink_mutex_destroy` only after the mutex is unlocked and all users
-have finished (usually after joining workers). Windows destruction is a no-op;
-lifetime rules still apply. Misuse is not reliably detected on either backend.
+have finished (usually after joining workers). A successful destroy frees the
+allocation on both backends and invalidates every handle to it. A failed
+POSIX destroy frees nothing and leaves the mutex live. Destroy each created
+mutex exactly once; create a new one before reusing the handle variable.
+Misuse is not reliably detected on either backend.
 No timed, recursive, or inter-process mutex operations are provided.
 
 Backend references: [Windows SRW locks](https://learn.microsoft.com/en-us/windows/win32/sync/slim-reader-writer--srw--locks),
@@ -151,16 +178,17 @@ unchanged. Both targets disable `COMPILE_WARNING_AS_ERROR` so it cannot add
 The test checks operation return values, both compare-exchange outcomes,
 signed wraparound, four workers producing 400,000 increments through both
 fetch-add and compare-exchange, and publication of ordinary data through an
-atomic ready flag. Mutex checks cover runtime/static initialization, reuse after
-destruction, contended and successful try-lock (including from a second thread),
-and 400,000 protected increments with a two-field invariant and data
-publication through the lock. Thread checks cover a refused self-join
+atomic ready flag. Mutex checks cover creation, recreation after destruction,
+1,000 create/destroy cycles with independent mutexes, contended and successful
+try-lock (including from a second thread), and 400,000 protected increments
+with a two-field invariant and data publication through the lock. Thread checks
+cover a refused self-join
 (`EDEADLK`) and 1,000 create/join cycles, which on Windows also verify that the
 process handle count does not grow and that joining a non-thread handle gives
-`EINVAL`. Waiting workers yield the CPU while they spin. The allocation and
-thread-creation failure paths (`ENOMEM`, `EAGAIN`) cannot be forced by these
-checks. Checks remain enabled in Release builds. CTest imposes a
-30-second timeout.
+`EINVAL`. Waiting workers yield the CPU while they spin. Allocation,
+mutex-initialization/destruction, and thread-creation failure paths cannot be
+forced by these regression checks. Checks remain enabled in Release builds.
+CTest imposes a 30-second timeout.
 
 Verified with warnings treated as errors in optimized builds:
 
